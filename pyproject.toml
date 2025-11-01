@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kohub-cli"
+version = "0.0.1"
+description = "A python client oh KohakuHub"
+authors = [
+    { name = "Shih-Ying Yeh(KohakuBlueLeaf)", email = "apolloyeh0123@gmail.com" },
+]
+license = { text = "Apache-2.0" }
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    # CLI Framework
+    "click>=8.0",
+    "questionary",
+    "rich",
+
+    # HTTP Client
+    "requests",
+
+    # Utilities
+    "loguru",
+    "pyyaml",
+]
+urls = { "Homepage" = "https://kblueleaf.net/Kohaku-Hub" }
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0.0",
+    "pytest-mock>=3.12.0",
+]
+
+
+[project.scripts]
+kohub-cli = "kohub_cli.cli:cli"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
