@@ -15,6 +15,7 @@ from .errors import (
     AuthorizationError,
     NotFoundError,
     AlreadyExistsError,
+    NetworkError
 )
 
 console = Console()
@@ -2224,6 +2225,48 @@ def health(ctx):
 
 # ========== Transfer Command ==========
 
+def should_skip_file(file_path):
+    """Check if file should be skipped during transfer."""
+    skip_patterns = {'.git', '.cache', '__pycache__', '.pytest_cache', 
+                    'node_modules', '.huggingface', '.DS_Store'}
+    return (
+        file_path.name.startswith('.') or
+        any(pattern in file_path.parts for pattern in skip_patterns) or
+        file_path.name.endswith(('.lock', '.tmp', '.temp'))
+    )
+
+def format_file_size(size_bytes):
+    """Format file size consistently."""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    else:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+
+def check_huggingface_hub_available(ctx):
+    """Check if huggingface_hub is available and show helpful error if not."""
+    try:
+        import huggingface_hub
+        return True
+    except ImportError:
+        console = ctx.obj["console"]
+        if ctx.obj.get("output", "text") == "json":
+            # For JSON output, use standard error handling
+            error = ImportError("huggingface_hub is required for HuggingFace Hub operations. Install with: pip install huggingface_hub")
+            handle_error(error, ctx)
+        else:
+            # For text output, show helpful installation instructions
+            console.print("[bold red]Error:[/bold red] huggingface_hub is required for HuggingFace Hub operations")
+            console.print("")
+            console.print("[yellow]To install huggingface_hub:[/yellow]")
+            console.print("  pip install huggingface_hub")
+            console.print("")
+            console.print("Or install with all optional dependencies:")
+            console.print("  pip install 'kohub-cli[transfer]'")
+            sys.exit(1)
+        return False
+
 
 @cli.command()
 @click.argument("source_repo_id")
@@ -2277,15 +2320,21 @@ def health(ctx):
     "--target-endpoint",
     help="Target hub (hf for HuggingFace Hub, or custom URL like https://hub.example.com). Defaults to current endpoint.",
 )
+@click.option(
+    "--verbose", "-v",
+    is_flag=True,
+    default=False,
+    help="Show detailed transfer progress",
+)
 @click.pass_context
-def transfer(ctx, source_repo_id, dest_repo_id, repo_type, include_lfs, private, force, token, hf_token, src_token, target_token, src_endpoint, target_endpoint):
+def transfer(ctx, source_repo_id, dest_repo_id, repo_type, include_lfs, private, force, token, hf_token, src_token, target_token, src_endpoint, target_endpoint, verbose):
     """Transfer a repository between different hubs (HuggingFace, KohakuHub, or custom hubs).
     
     Examples:
     
     \b
     # Transfer from HuggingFace to current KohakuHub endpoint
-    kohub-cli transfer deepseek-ai/DeepSeek-OCR theblackcat102/DeepSeek-OCR
+    kohub-cli transfer deepseek-ai/DeepSeek-OCR user/DeepSeek-OCR
     
     \b
     # Transfer from custom hub to HuggingFace
@@ -2304,14 +2353,12 @@ def transfer(ctx, source_repo_id, dest_repo_id, repo_type, include_lfs, private,
     kohub-cli transfer user/model user/model --src-endpoint https://hub1.com --target-endpoint https://hub2.com --src-token <token1> --target-token <token2>
     """
     import tempfile
-    import shutil
     from pathlib import Path
-    from huggingface_hub import snapshot_download, repo_info
-    from huggingface_hub.utils import RepositoryNotFoundError
     
     try:
         client = ctx.obj["client"]
         console = ctx.obj["console"]
+        show_progress = ctx.obj.get("output", "text") == "text" and verbose
         
         # Determine source and target endpoints
         source_endpoint = "https://huggingface.co" if src_endpoint == "hf" else src_endpoint
@@ -2322,10 +2369,10 @@ def transfer(ctx, source_repo_id, dest_repo_id, repo_type, include_lfs, private,
             # Default to current client endpoint
             target_endpoint = client.endpoint
         
-        console.print(f"🔄 Transfer: {source_endpoint} → {target_endpoint}")
+        if show_progress:
+            console.print(f"🔄 Starting transfer from {source_endpoint} to {target_endpoint}")
         
         # Determine tokens for source and target
-        # For source: use src_token if provided, else hf_token for HF, else token
         if src_token:
             final_source_token = src_token
         elif source_endpoint == "https://huggingface.co":
@@ -2333,7 +2380,6 @@ def transfer(ctx, source_repo_id, dest_repo_id, repo_type, include_lfs, private,
         else:
             final_source_token = token
             
-        # For target: use target_token if provided, else hf_token for HF, else token
         if target_token:
             final_target_token = target_token
         elif target_endpoint == "https://huggingface.co":
@@ -2348,53 +2394,60 @@ def transfer(ctx, source_repo_id, dest_repo_id, repo_type, include_lfs, private,
             target_client = KohubClient(endpoint=target_endpoint, token=final_target_token, config=Config())
         else:
             target_client = client
-            # Override token if provided
             if final_target_token:
                 target_client.token = final_target_token
         
         # Auto-detect repository type if needed
         detected_repo_type = repo_type
         if repo_type == "auto":
-            console.print(f"🔍 Detecting repository type for {source_repo_id} on {source_endpoint}...")
+            if show_progress:
+                console.print(f"🔍 Detecting repository type...")
             
             if source_endpoint == "https://huggingface.co":
-                # Use HuggingFace Hub for detection
+                # Check if huggingface_hub is available for HuggingFace operations
+                if not check_huggingface_hub_available(ctx):
+                    return
+                
+                from huggingface_hub import repo_info
+                from huggingface_hub.utils import RepositoryNotFoundError
+                
                 try:
-                    # Try as model first
-                    info = repo_info(source_repo_id, repo_type="model", token=final_source_token)
+                    repo_info(source_repo_id, repo_type="model", token=final_source_token)
                     detected_repo_type = "model"
-                    console.print(f"✓ Detected as [bold blue]model[/bold blue]")
                 except RepositoryNotFoundError:
                     try:
-                        # Try as dataset
-                        info = repo_info(source_repo_id, repo_type="dataset", token=final_source_token)
+                        repo_info(source_repo_id, repo_type="dataset", token=final_source_token)
                         detected_repo_type = "dataset"
-                        console.print(f"✓ Detected as [bold green]dataset[/bold green]")
                     except RepositoryNotFoundError:
                         raise NotFoundError(f"Repository '{source_repo_id}' not found on {source_endpoint}")
             else:
-                # Use custom hub for detection - create a temporary client
                 from .client import KohubClient
                 from .config import Config
                 source_client = KohubClient(endpoint=source_endpoint, token=final_source_token, config=Config())
                 try:
-                    # Try as model first
                     source_client.repo_info(source_repo_id, repo_type="model")
                     detected_repo_type = "model"
-                    console.print(f"✓ Detected as [bold blue]model[/bold blue]")
                 except NotFoundError:
                     try:
-                        # Try as dataset
                         source_client.repo_info(source_repo_id, repo_type="dataset")
                         detected_repo_type = "dataset"
-                        console.print(f"✓ Detected as [bold green]dataset[/bold green]")
                     except NotFoundError:
                         raise NotFoundError(f"Repository '{source_repo_id}' not found on {source_endpoint}")
+            
+            if show_progress:
+                console.print(f"✓ Detected as {detected_repo_type}")
         else:
             # Verify the repository exists with specified type
             if source_endpoint == "https://huggingface.co":
+                # Check if huggingface_hub is available for HuggingFace operations
+                if not check_huggingface_hub_available(ctx):
+                    return
+                
+                from huggingface_hub import repo_info
+                from huggingface_hub.utils import RepositoryNotFoundError
+                
                 try:
-                    info = repo_info(source_repo_id, repo_type=detected_repo_type, token=final_source_token)
+                    repo_info(source_repo_id, repo_type=detected_repo_type, token=final_source_token)
                 except RepositoryNotFoundError:
                     raise NotFoundError(f"Repository '{source_repo_id}' not found as {detected_repo_type} on {source_endpoint}")
             else:
@@ -2411,20 +2464,26 @@ def transfer(ctx, source_repo_id, dest_repo_id, repo_type, include_lfs, private,
             raise ValueError("Destination repo_id must be in format 'namespace/name'")
         
         try:
-            existing_repo = target_client.repo_info(dest_repo_id, repo_type=detected_repo_type)
+            target_client.repo_info(dest_repo_id, repo_type=detected_repo_type)
             if not force:
-                raise AlreadyExistsError(f"Repository '{dest_repo_id}' already exists on {target_endpoint}. Use --force to overwrite.")
-            console.print(f"⚠️  Repository '{dest_repo_id}' exists on {target_endpoint}, will overwrite due to --force")
+                raise AlreadyExistsError(f"Repository '{dest_repo_id}' already exists. Use --force to overwrite.")
+            if show_progress:
+                console.print(f"⚠️  Repository exists, overwriting due to --force")
         except NotFoundError:
-            # Repository doesn't exist, we'll create it
             pass
         
         # Download from source hub
         with tempfile.TemporaryDirectory() as temp_dir:
-            console.print(f"📥 Downloading {source_repo_id} from {source_endpoint}...")
+            if show_progress:
+                console.print(f"📥 Downloading from source...")
             
             if source_endpoint == "https://huggingface.co":
-                # Download from HuggingFace Hub
+                # Check if huggingface_hub is available for HuggingFace operations
+                if not check_huggingface_hub_available(ctx):
+                    return
+                
+                from huggingface_hub import snapshot_download
+                
                 try:
                     local_dir = snapshot_download(
                         repo_id=source_repo_id,
@@ -2437,133 +2496,140 @@ def transfer(ctx, source_repo_id, dest_repo_id, repo_type, include_lfs, private,
                 except Exception as e:
                     raise NetworkError(f"Failed to download from {source_endpoint}: {e}")
             else:
-                # Download from custom hub using huggingface_hub with custom endpoint
+                # For custom hubs (like KohakuHub), use native KohubClient download
+                from .client import KohubClient
+                from .config import Config
+                source_client = KohubClient(endpoint=source_endpoint, token=final_source_token, config=Config())
+                
                 try:
-                    local_dir = snapshot_download(
-                        repo_id=source_repo_id,
+                    # Get list of all files in the repository
+                    if show_progress:
+                        console.print(f"  📋 Getting file list from {source_repo_id}...")
+                    
+                    files = source_client.list_repo_tree(
+                        source_repo_id,
                         repo_type=detected_repo_type,
-                        local_dir=temp_dir,
-                        local_dir_use_symlinks=False,
-                        ignore_patterns=[] if include_lfs else ["*.bin", "*.safetensors", "*.gguf", "*.h5", "*.onnx"],
-                        token=final_source_token,
-                        endpoint=source_endpoint,
+                        revision="main",
+                        recursive=True
                     )
+                    
+                    # Filter out directories and files to skip
+                    files_to_download = []
+                    for f in files:
+                        if f.get("type") == "directory":
+                            continue
+                        file_path = f.get("path", "")
+                        if file_path and not should_skip_file(Path(file_path)):
+                            files_to_download.append(f)
+                    
+                    if not include_lfs:
+                        # Filter out large binary files if LFS is disabled
+                        lfs_extensions = {".bin", ".safetensors", ".gguf", ".h5", ".onnx"}
+                        files_to_download = [
+                            f for f in files_to_download
+                            if not any(f.get("path", "").lower().endswith(ext) for ext in lfs_extensions)
+                        ]
+                    
+                    if show_progress:
+                        console.print(f"  📦 Downloading {len(files_to_download)} files...")
+                    
+                    # Download each file
+                    local_dir = temp_dir
+                    for file_info in files_to_download:
+                        file_path = file_info.get("path", "")
+                        if not file_path:
+                            continue
+                            
+                        local_file_path = Path(temp_dir) / file_path
+                        
+                        # Create parent directories
+                        local_file_path.parent.mkdir(parents=True, exist_ok=True)
+                        
+                        if show_progress:
+                            file_size = file_info.get("size", 0)
+                            size_str = format_file_size(file_size)
+                            console.print(f"    📄 {file_path} ({size_str})")
+                        
+                        # Download the file
+                        source_client.download_file(
+                            repo_id=source_repo_id,
+                            repo_path=file_path,
+                            local_path=str(local_file_path),
+                            repo_type=detected_repo_type,
+                            revision="main"
+                        )
+                    
                 except Exception as e:
                     raise NetworkError(f"Failed to download from {source_endpoint}: {e}")
             
-            console.print(f"✓ Downloaded to temporary directory")
-            
             # Create repository on target hub if it doesn't exist
             try:
-                repo_info_result = target_client.repo_info(dest_repo_id, repo_type=detected_repo_type)
+                target_client.repo_info(dest_repo_id, repo_type=detected_repo_type)
             except NotFoundError:
-                console.print(f"📝 Creating repository {dest_repo_id} on {target_endpoint}...")
+                if show_progress:
+                    console.print(f"📝 Creating repository...")
                 target_client.create_repo(
                     repo_id=dest_repo_id,
                     repo_type=detected_repo_type,
                     private=private,
                 )
-                console.print(f"✓ Created {detected_repo_type} repository")
-                
-            # Get LFS settings to understand what files should use LFS (only for KohakuHub-like targets)
-            if target_endpoint != "https://huggingface.co":
-                try:
-                    lfs_settings = target_client.get_repo_lfs_settings(dest_repo_id, repo_type=detected_repo_type)
-                    lfs_threshold = lfs_settings.get("effective", {}).get("lfs_threshold_bytes", 1000000)
-                    lfs_suffix_rules = lfs_settings.get("effective", {}).get("lfs_suffix_rules", [])
-                    console.print(f"📋 LFS settings: threshold={lfs_threshold} bytes, suffix_rules={lfs_suffix_rules}")
-                except Exception as e:
-                    # Default values if can't get settings
-                    lfs_threshold = 1000000
-                    lfs_suffix_rules = ['.parquet', '.bin', '.safetensors', '.gguf']
-                    console.print(f"⚠️  Could not get LFS settings, using defaults: {e}")
-            else:
-                # HuggingFace Hub defaults
-                lfs_threshold = 1000000
-                lfs_suffix_rules = ['.parquet', '.bin', '.safetensors', '.gguf']
             
             # Upload all files to target hub
-            target_hub_name = "HuggingFace Hub" if target_endpoint == "https://huggingface.co" else target_endpoint
-            console.print(f"📤 Uploading files to {target_hub_name}...")
-            local_path = Path(local_dir)
+            if show_progress:
+                console.print(f"📤 Uploading files...")
             
+            local_path = Path(local_dir)
             uploaded_count = 0
             skipped_count = 0
+            failed_files = []
+            
             for file_path in local_path.rglob("*"):
-                if file_path.is_file():
-                    # Skip hidden files and common cache/temp directories
-                    skip_patterns = {'.git', '.cache', '__pycache__', '.pytest_cache', 
-                                   'node_modules', '.huggingface', '.DS_Store'}
-                    
-                    should_skip = (
-                        file_path.name.startswith('.') or  # Hidden files
-                        any(pattern in file_path.parts for pattern in skip_patterns) or  # Cache directories
-                        file_path.name.endswith(('.lock', '.tmp', '.temp'))  # Temp files
-                    )
-                    
-                    if should_skip:
-                        skipped_count += 1
-                        continue
-                    
-                    # Calculate relative path for repository
+                if file_path.is_file() and not should_skip_file(file_path):
                     repo_path = str(file_path.relative_to(local_path))
                     
-                    # Check file size and type
-                    file_size = file_path.stat().st_size
-                    size_mb = file_size / (1024 * 1024)
-                    file_ext = file_path.suffix.lower()
-                    
-                    # Check if file should use LFS based on repository settings
-                    should_use_lfs = (
-                        file_size >= lfs_threshold or 
-                        file_ext in lfs_suffix_rules
-                    )
-                    
                     try:
-                        if size_mb < 1:
-                            size_kb = file_size / 1024
-                            if should_use_lfs:
-                                console.print(f"  📄 Uploading {repo_path} ({size_kb:.1f}KB - LFS file)...")
-                            else:
-                                console.print(f"  📄 Uploading {repo_path} ({size_kb:.1f}KB)...")
-                        else:
-                            if should_use_lfs:
-                                console.print(f"  📄 Uploading {repo_path} ({size_mb:.1f}MB - LFS file)...")
-                            else:
-                                console.print(f"  📄 Uploading {repo_path} ({size_mb:.1f}MB)...")
-                            
-                        # For now, we'll upload normally since the client doesn't have LFS upload yet
-                        # TODO: Implement proper LFS upload when client supports it
-                        if should_use_lfs and size_mb > 100:
-                            console.print(f"      ⚠️  Large file ({size_mb:.1f}MB) - may fail without proper LFS support")
-                            
-                        result = target_client.upload_file(
+                        if show_progress:
+                            size_str = format_file_size(file_path.stat().st_size)
+                            console.print(f"  📄 {repo_path} ({size_str})")
+                        
+                        target_client.upload_file(
                             repo_id=dest_repo_id,
                             local_path=str(file_path),
                             repo_path=repo_path,
                             repo_type=detected_repo_type,
-                            commit_message=f"Transfer {repo_path} from {source_endpoint}"
+                            commit_message=f"Transfer {repo_path}"
                         )
                         uploaded_count += 1
-                        console.print(f"  ✓ Uploaded {repo_path}")
+                        
                     except Exception as e:
-                        console.print(f"  ⚠️  Failed to upload {repo_path}: {type(e).__name__}: {e}")
-                        # Print more detailed error information
-                        import traceback
-                        tb_lines = traceback.format_exc().strip().split('\n')
-                        if len(tb_lines) > 2:
-                            console.print(f"      Debug: {tb_lines[-2]}")
-                        # Continue with other files instead of stopping
+                        failed_files.append({"file": repo_path, "error": str(e)})
+                        if show_progress:
+                            console.print(f"  ⚠️  Failed: {repo_path} - {e}")
+                elif file_path.is_file():
+                    skipped_count += 1
             
+            # Standard result output
             source_hub_name = "HuggingFace Hub" if source_endpoint == "https://huggingface.co" else source_endpoint
+            target_hub_name = "HuggingFace Hub" if target_endpoint == "https://huggingface.co" else target_endpoint
             
-            console.print(f"✅ Transfer completed!")
-            console.print(f"   📊 Uploaded {uploaded_count} files")
-            if skipped_count > 0:
-                console.print(f"   ⏭️  Skipped {skipped_count} cache/temp files")
-            console.print(f"   🎯 Source: {source_repo_id} ({source_hub_name})")
-            console.print(f"   🏠 Destination: {dest_repo_id} ({target_hub_name})")
-            console.print(f"   📁 Type: {detected_repo_type}")
+            result_data = {
+                "source_repo": source_repo_id,
+                "dest_repo": dest_repo_id,
+                "repo_type": detected_repo_type,
+                "files_uploaded": uploaded_count,
+                "files_skipped": skipped_count,
+                "files_failed": len(failed_files),
+                "source_endpoint": source_hub_name,
+                "target_endpoint": target_hub_name,
+                "failed_files": failed_files
+            }
+            
+            if failed_files:
+                success_message = f"Transfer completed with {len(failed_files)} failures - {dest_repo_id} ({uploaded_count} files uploaded)"
+            else:
+                success_message = f"Successfully transferred {dest_repo_id} ({uploaded_count} files)"
+            
+            output_result(ctx, result_data, success_message)
     
     except Exception as e:
         handle_error(e, ctx)

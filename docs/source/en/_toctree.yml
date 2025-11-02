@@ -1,0 +1,50 @@
+- title: 'Get started'
+  sections:
+    - local: index
+      title: Home
+    - local: quick-start
+      title: Quickstart
+    - local: installation
+      title: Installation
+- title: 'How-to guides'
+  sections:
+    - local: guides/overview
+      title: Overview
+    - local: guides/authentication
+      title: Authentication
+    - local: guides/repository-management
+      title: Repository Management
+    - local: guides/file-operations
+      title: File Operations
+    - local: guides/organization-management
+      title: Organization Management
+    - local: guides/cli-usage
+      title: Use the CLI
+    - local: guides/interactive-mode
+      title: Interactive Mode
+    - local: guides/configuration
+      title: Configuration
+    - local: guides/transfer-functions
+      title: Transfer Functions
+- title: 'Conceptual guides'
+  sections:
+    - local: concepts/kohaku-vs-huggingface
+      title: KohakuHub vs Hugging Face
+    - local: concepts/repository-types
+      title: Repository Types
+- title: 'Reference'
+  sections:
+    - local: package_reference/overview
+      title: Overview
+    - local: package_reference/cli
+      title: CLI Commands
+    - local: package_reference/authentication
+      title: Authentication
+    - local: package_reference/repository-api
+      title: Repository API
+    - local: package_reference/file-operations
+      title: File Operations
+    - local: package_reference/organization-api
+      title: Organization API
+    - local: package_reference/configuration
+      title: Configuration

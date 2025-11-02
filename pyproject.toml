@@ -34,6 +34,9 @@ dev = [
     "pytest-cov>=4.0.0",
     "pytest-mock>=3.12.0",
 ]
+transfer = [
+    "huggingface_hub>=0.17.0",
+]
 
 
 [project.scripts]
